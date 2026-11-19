@@ -1,0 +1,412 @@
+
+<!doctype html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>CareSlot | Clinic Coordination Agent</title>
+    <link rel="stylesheet" href="/static/style.css">
+
+    <style>
+        .voice-button {
+            background: #eef4ff;
+            color: #2459b8;
+            border: 1px solid #d5e2fa;
+            border-radius: 10px;
+            padding: 0 18px;
+            cursor: pointer;
+            font-size: 15px;
+            font-weight: 600;
+            min-width: 105px;
+        }
+
+        .voice-button:hover {
+            background: #dce9ff;
+        }
+
+        .voice-button.listening {
+            background: #fee2e2;
+            color: #b91c1c;
+            border-color: #fecaca;
+        }
+
+        .voice-status {
+            display: block;
+            margin-top: 8px;
+            font-size: 13px;
+            color: #64748b;
+            min-height: 18px;
+        }
+
+        .chat-form {
+            display: flex;
+            gap: 10px;
+            align-items: stretch;
+        }
+
+        .chat-form input {
+            flex: 1;
+            min-width: 0;
+        }
+
+        @media (max-width: 600px) {
+            .chat-form {
+                flex-wrap: wrap;
+            }
+
+            .chat-form input {
+                width: 100%;
+            }
+
+            .voice-button {
+                flex: 1;
+                min-height: 44px;
+            }
+        }
+    </style>
+</head>
+
+<body>
+<div class="app">
+
+    <!-- SIDEBAR -->
+    <aside class="sidebar">
+        <div class="brand">
+            <span class="logo">✚</span>
+            <div>
+                <b>CareSlot</b>
+                <small>Clinic coordination agent</small>
+            </div>
+        </div>
+
+        <nav>
+            <a class="active" href="#overview">▦ &nbsp; Overview</a>
+            <a href="#appointments">▣ &nbsp; Appointments</a>
+            <a href="#agent">✧ &nbsp; AI Assistant</a>
+            <a href="#reports">▤ &nbsp; Reports</a>
+        </nav>
+
+        <div class="side-note">
+            <b>Demo environment</b>
+            <p>Uses fictional patient data. Reminders are simulated.</p>
+        </div>
+    </aside>
+
+    <main>
+
+        <!-- HEADER -->
+        <header>
+            <div>
+                <p class="eyebrow">CLINIC OPERATIONS</p>
+                <h1>Good day, Care team</h1>
+                <p class="muted">
+                    Manage bookings, schedules and patient coordination.
+                </p>
+            </div>
+            <div class="today" id="today"></div>
+        </header>
+
+        <!-- DASHBOARD STATISTICS -->
+        <section class="stats" id="overview">
+
+            <div class="stat">
+                <span>Active bookings</span>
+                <b id="total">—</b>
+                <small>Upcoming appointments</small>
+            </div>
+
+            <div class="stat">
+                <span>Booked records</span>
+                <b id="booked">—</b>
+                <small>All demo records</small>
+            </div>
+
+            <div class="stat">
+                <span>Cancelled</span>
+                <b id="cancelled">—</b>
+                <small>Released slots</small>
+            </div>
+
+            <div class="stat">
+                <span>Waitlist</span>
+                <b id="waitlist">—</b>
+                <small>Patients waiting</small>
+            </div>
+
+        </section>
+
+        <!-- AI ASSISTANT -->
+        <section class="panel" id="agent">
+
+            <div class="panel-head">
+                <div>
+                    <p class="eyebrow">CARE SLOT AI</p>
+                    <h2>Appointment assistant</h2>
+                    <p class="muted">
+                        Try: “Book Dr. Kumar tomorrow at 2 PM for Rahul Sharma”
+                    </p>
+                </div>
+
+                <span class="online">● Demo agent online</span>
+            </div>
+
+            <div class="chat" id="chat">
+                <div class="bubble bot">
+                    Hello! I'm CareSlot, your clinic coordination assistant.
+                    I can check doctor availability, book appointments,
+                    cancel bookings and add patients to a waitlist.
+                </div>
+            </div>
+
+            <!-- TEXT AND VOICE INPUT -->
+            <form id="chatForm" class="chat-form">
+
+                <input
+                    id="message"
+                    placeholder="Type or speak an appointment request..."
+                    autocomplete="off">
+
+                <button
+                    type="button"
+                    id="voiceButton"
+                    class="voice-button"
+                    title="Speak your appointment request">
+                    🎙 Speak
+                </button>
+
+                <button type="submit">
+                    Send request
+                </button>
+
+            </form>
+
+            <span
+                id="voiceStatus"
+                class="voice-status"
+                aria-live="polite">
+            </span>
+
+            <div class="quick">
+                <button onclick="quick('Show Dr. Kumar availability tomorrow')">
+                    Check availability
+                </button>
+
+                <button onclick="quick('Book Dr. Priya tomorrow at 3 PM for Meera Das')">
+                    Try booking
+                </button>
+
+                <button onclick="quick('Add me to Dr. Shah waitlist')">
+                    Join waitlist
+                </button>
+            </div>
+
+        </section>
+
+        <!-- APPOINTMENTS -->
+        <section class="panel" id="appointments">
+
+            <div class="panel-head">
+                <div>
+                    <p class="eyebrow">SCHEDULE</p>
+                    <h2>Appointments</h2>
+                </div>
+
+                <button class="secondary" onclick="load()">
+                    Refresh
+                </button>
+            </div>
+
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>Patient</th>
+                            <th>Doctor</th>
+                            <th>Date</th>
+                            <th>Time</th>
+                            <th>Status</th>
+                            <th>Action</th>
+                        </tr>
+                    </thead>
+
+                    <tbody id="rows"></tbody>
+                </table>
+            </div>
+
+        </section>
+
+        <!-- WAITLIST MANAGEMENT -->
+        <section class="panel" id="waitlistPanel">
+
+            <div class="panel-head">
+                <div>
+                    <p class="eyebrow">PATIENT COORDINATION</p>
+                    <h2>Waitlist Management</h2>
+                    <p class="muted">
+                        Manage patients waiting for appointments.
+                    </p>
+                </div>
+
+                <button class="secondary" onclick="loadWaitlist()">
+                    Refresh
+                </button>
+            </div>
+
+            <div class="table-wrap">
+                <table>
+
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>PATIENT</th>
+                            <th>DOCTOR</th>
+                            <th>PREFERRED DATE</th>
+                            <th>TIME</th>
+                            <th>STATUS</th>
+                            <th>ACTION</th>
+                        </tr>
+                    </thead>
+
+                    <tbody id="waitlistTable">
+                        <tr>
+                            <td colspan="7">Loading waitlist...</td>
+                        </tr>
+                    </tbody>
+
+                </table>
+            </div>
+
+        </section>
+
+        <!-- DAILY OPERATIONS REPORT -->
+        <section class="panel" id="reports">
+
+            <div class="panel-head">
+                <div>
+                    <p class="eyebrow">INSIGHTS</p>
+                    <h2>Daily operations report</h2>
+                </div>
+
+                <button class="secondary" onclick="report()">
+                    Refresh report
+                </button>
+            </div>
+
+            <div id="reportBody" class="report-grid">
+                <p class="muted">
+                    Load report to view explainable no-show risk estimates.
+                </p>
+            </div>
+
+            <p class="footnote">
+                No-show risk is a transparent demonstration heuristic,
+                not a clinically validated model. No real messages are sent.
+            </p>
+
+        </section>
+
+        <!-- FOOTER -->
+        <footer>
+            CareSlot prototype · Healthcare administration only · No medical advice
+        </footer>
+
+    </main>
+</div>
+
+<!-- EXISTING APPLICATION JAVASCRIPT -->
+<script src="/static/app.js"></script>
+
+<!-- VOICE RECOGNITION -->
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+
+    const voiceButton = document.getElementById("voiceButton");
+    const messageInput = document.getElementById("message");
+    const voiceStatus = document.getElementById("voiceStatus");
+
+    const SpeechRecognition =
+        window.SpeechRecognition ||
+        window.webkitSpeechRecognition;
+
+    if (!SpeechRecognition) {
+        voiceButton.disabled = true;
+        voiceButton.textContent = "Voice unavailable";
+        voiceStatus.textContent =
+            "Speech recognition is not supported by this browser. Please use Chrome.";
+        return;
+    }
+
+    const recognition = new SpeechRecognition();
+
+    recognition.lang = "en-IN";
+    recognition.continuous = false;
+    recognition.interimResults = false;
+    recognition.maxAlternatives = 1;
+
+    let isListening = false;
+
+    voiceButton.addEventListener("click", function () {
+
+        if (isListening) {
+            recognition.stop();
+            return;
+        }
+
+        try {
+            recognition.start();
+        } catch (error) {
+            voiceStatus.textContent =
+                "Voice recognition could not start. Please try again.";
+        }
+    });
+
+    recognition.onstart = function () {
+        isListening = true;
+
+        voiceButton.textContent = "■ Stop";
+        voiceButton.classList.add("listening");
+
+        voiceStatus.textContent =
+            "🎙 Listening... Speak your appointment request.";
+    };
+
+    recognition.onresult = function (event) {
+
+        const transcript =
+            event.results[0][0].transcript;
+
+        messageInput.value = transcript;
+        messageInput.focus();
+
+        voiceStatus.textContent =
+            "Speech converted successfully. Review the text and click Send request.";
+    };
+
+    recognition.onerror = function (event) {
+
+        if (event.error === "not-allowed") {
+            voiceStatus.textContent =
+                "Microphone permission denied. Allow microphone access in your browser.";
+        } else if (event.error === "no-speech") {
+            voiceStatus.textContent =
+                "No speech detected. Please try speaking again.";
+        } else {
+            voiceStatus.textContent =
+                "Voice recognition error: " + event.error;
+        }
+    };
+
+    recognition.onend = function () {
+        isListening = false;
+
+        voiceButton.textContent = "🎙 Speak";
+        voiceButton.classList.remove("listening");
+    };
+
+});
+</script>
+
+</body>
+</html>
