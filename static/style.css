@@ -197,6 +197,34 @@ h2 {
     margin-bottom: 20px;
 }
 
+.doctor-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+    gap: 12px;
+}
+
+.doctor-card {
+    background: #f7f9fc;
+    border: 1px solid var(--line);
+    border-radius: 11px;
+    padding: 15px 17px;
+}
+
+.doctor-card h3 {
+    margin: 0 0 8px;
+    font: 700 14px Manrope, sans-serif;
+    color: var(--navy);
+}
+
+.doctor-card ul {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    color: var(--muted);
+    font-size: 13px;
+    line-height: 1.9;
+}
+
 .stat,
 .panel {
     background: white;
@@ -242,6 +270,22 @@ h2 {
     align-items: center;
     gap: 15px;
     margin-bottom: 19px;
+}
+
+.report-date-label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--muted);
+    font-size: 12px;
+}
+
+.report-date-label input {
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 9px 10px;
+    color: var(--ink);
+    background: white;
 }
 
 .online {
@@ -407,6 +451,16 @@ th {
     font-weight: 700;
 }
 
+.waitlist-day-row th {
+    background: #edf4ff;
+    color: var(--navy);
+    border-top: 1px solid var(--line);
+    text-transform: none;
+    letter-spacing: 0;
+    font-size: 12px;
+    padding: 12px;
+}
+
 tbody tr {
     transition: background .15s;
 }
@@ -434,6 +488,11 @@ tbody tr:last-child td {
 .pill.cancelled {
     background: #fff0ef;
     color: #b33b35;
+}
+
+.pill.offered {
+    background: #fff5df;
+    color: #8b5b00;
 }
 
 /* SMALL ACTION BUTTONS */

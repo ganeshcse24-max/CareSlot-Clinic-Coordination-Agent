@@ -13,6 +13,13 @@ $("today").textContent = new Date().toLocaleDateString(undefined, {
     year: "numeric"
 });
 
+const reportDateInput = $("reportDate");
+if (reportDateInput) {
+    const now = new Date();
+    reportDateInput.value = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+    reportDateInput.addEventListener("change", () => report());
+}
+
 function addBubble(text, who) {
     const el = document.createElement("div");
     el.className = "bubble " + who;
@@ -29,53 +36,11 @@ function addBubble(text, who) {
 
 const chatForm = $("chatForm");
 const messageInput = $("message");
+let pendingRequest = "";
+let chatContext = null;
 
-// Find existing Speak buttons to prevent duplicates
-const existingSpeakButtons = [
-    ...chatForm.querySelectorAll("button")
-].filter(button =>
-    button.textContent.toLowerCase().includes("speak")
-);
-
-// Reuse the first existing Speak button
-let voiceButton = existingSpeakButtons[0];
-
-// Remove any extra Speak buttons
-existingSpeakButtons.slice(1).forEach(button => button.remove());
-
-// Create a Speak button only if one does not already exist
-if (!voiceButton) {
-    voiceButton = document.createElement("button");
-    voiceButton.type = "button";
-    voiceButton.textContent = "🎙 Speak";
-    voiceButton.className = "secondary";
-
-    const sendButton = chatForm.querySelector("button");
-
-    if (sendButton) {
-        chatForm.insertBefore(voiceButton, sendButton);
-    } else {
-        chatForm.appendChild(voiceButton);
-    }
-}
-
-voiceButton.type = "button";
-voiceButton.style.whiteSpace = "nowrap";
-
-// Create or reuse the voice status message
-let voiceStatus = document.getElementById("voiceStatus");
-
-if (!voiceStatus) {
-    voiceStatus = document.createElement("p");
-    voiceStatus.id = "voiceStatus";
-    voiceStatus.className = "muted";
-    voiceStatus.style.marginTop = "10px";
-
-    chatForm.insertAdjacentElement("afterend", voiceStatus);
-}
-
-voiceStatus.textContent =
-    "Click Speak and say your appointment request.";
+const voiceButton = $("voiceButton");
+const voiceStatus = $("voiceStatus");
 
 const SpeechRecognition =
     window.SpeechRecognition ||
@@ -112,10 +77,11 @@ if (SpeechRecognition) {
     };
 
     recognition.onerror = event => {
-        voiceStatus.textContent =
-            "Voice error: " + event.error +
-            ". Please try again.";
-
+        voiceStatus.textContent = event.error === "not-allowed"
+            ? "Microphone permission was denied. Allow access in your browser and try again."
+            : event.error === "no-speech"
+                ? "No speech detected. Please try again."
+                : "Voice recognition error: " + event.error;
         listening = false;
         voiceButton.textContent = "🎙 Speak";
     };
@@ -146,7 +112,7 @@ if (SpeechRecognition) {
     voiceButton.textContent = "Voice unavailable";
 
     voiceStatus.textContent =
-        "Voice recognition is not supported. Please try Google Chrome.";
+        "Voice recognition is not supported by this browser. Please use Chrome.";
 }
 
 
@@ -238,6 +204,38 @@ async function load() {
     }
 }
 
+async function loadDoctors() {
+    const container = $("doctorDirectory");
+    try {
+        const response = await fetch("/api/doctors");
+        if (!response.ok) throw new Error("Doctor directory request failed");
+        const data = await response.json();
+        const groups = new Map();
+        data.doctors.forEach(doctor => {
+            if (!groups.has(doctor.specialty)) groups.set(doctor.specialty, []);
+            groups.get(doctor.specialty).push(doctor);
+        });
+        container.replaceChildren();
+        groups.forEach((doctors, specialty) => {
+            const card = document.createElement("article");
+            card.className = "doctor-card";
+            const heading = document.createElement("h3");
+            heading.textContent = specialty;
+            const list = document.createElement("ul");
+            doctors.forEach(doctor => {
+                const item = document.createElement("li");
+                item.textContent = doctor.name;
+                list.appendChild(item);
+            });
+            card.append(heading, list);
+            container.appendChild(card);
+        });
+    } catch (error) {
+        container.textContent = "Unable to load the doctor directory.";
+        console.error("Doctor directory loading error:", error);
+    }
+}
+
 
 // ==============================
 // CHAT ASSISTANT
@@ -247,6 +245,19 @@ async function sendMessage(message) {
 
     addBubble(message, "user");
 
+    let combinedMessage = [pendingRequest, message].filter(Boolean).join(" ");
+    const isGreeting = /^(hi|hello|hey|good morning|good afternoon|good evening)[!. ,]*$/i.test(message.trim());
+    if (isGreeting) combinedMessage = message;
+    const hasShortTime = /^(?:(?:make|book|schedule|reserve)\s+)?(?:it\s+)?(?:at|on)\s*(?:14|15|16|2|3|4)(?:\s*(?:am|pm))?[!. ,]*$/i.test(message.trim());
+    const namesTarget = /\bdr\.?\s+[a-z]+\b|dermat|skin doctor|cardio|heart doctor|general medicine|family doctor/i.test(message);
+    if (!pendingRequest && !namesTarget && !isGreeting && chatContext && Date.now() - chatContext.savedAt < 120000 &&
+        /\b(?:book|make|schedule|reserve)\b/i.test(message) && chatContext.doctor) {
+        combinedMessage = `Book ${chatContext.doctor} ${chatContext.date || ""} ${message}`;
+    } else if (!pendingRequest && !namesTarget && !isGreeting && hasShortTime && chatContext &&
+        Date.now() - chatContext.savedAt < 120000 && chatContext.doctor) {
+        combinedMessage = `Book ${chatContext.doctor} ${chatContext.date || ""} ${message}`;
+    }
+
     try {
 
         const response = await fetch("/api/chat", {
@@ -254,7 +265,7 @@ async function sendMessage(message) {
             headers: {
                 "Content-Type": "application/json"
             },
-            body: JSON.stringify({ message })
+            body: JSON.stringify({ message: combinedMessage })
         });
 
         const data = await response.json();
@@ -263,6 +274,16 @@ async function sendMessage(message) {
             data.reply || data.message,
             "bot"
         );
+
+        // Keep the request only while the assistant is waiting for a detail.
+        // This lets short replies such as "Dr. Priya" or "tomorrow at 3" work.
+        const needsDetail = /which doctor|specify a time|provide your name|who should i add|include an appointment id|provide the appointment id/i.test(data.reply || "");
+        if (!isGreeting) pendingRequest = needsDetail ? combinedMessage : "";
+        if (data.context && data.context.doctor) {
+            chatContext = { ...data.context, savedAt: Date.now() };
+        } else if (data.action === "book" || data.action === "reschedule") {
+            chatContext = null;
+        }
 
         await Promise.all([
             load(),
@@ -341,7 +362,11 @@ async function report() {
 
     try {
 
-        const response = await fetch("/api/report");
+        const selectedDate = $("reportDate")?.value || "";
+        const reportUrl = selectedDate
+            ? "/api/report?date=" + encodeURIComponent(selectedDate)
+            : "/api/report";
+        const response = await fetch(reportUrl);
 
         if (!response.ok) {
             throw new Error("Report request failed");
@@ -350,17 +375,22 @@ async function report() {
         const data = await response.json();
 
         const container = $("reportBody");
+        $("reportNote").textContent = data.utilisation_note;
 
         container.replaceChildren();
 
         const cards = [
             {
                 title: data.booked,
-                description: "Active bookings"
+                description: `Booked on ${data.date}`
             },
             {
                 title: data.cancelled,
-                description: "Cancelled bookings"
+                description: "Cancelled that day"
+            },
+            {
+                title: `${data.utilisation_pct}%`,
+                description: `${data.booked} of ${data.capacity} daily slots used`
             }
         ];
 
@@ -377,6 +407,17 @@ async function report() {
                 document.createTextNode(item.description)
             );
 
+            container.appendChild(card);
+        });
+
+        data.utilisation_by_doctor.forEach(item => {
+            const card = document.createElement("div");
+            card.className = "risk-card";
+            const title = document.createElement("b");
+            title.textContent = item.doctor;
+            const details = document.createElement("div");
+            details.textContent = `${item.specialty} · ${item.booked}/${item.capacity} slots · ${item.utilisation_pct}% used`;
+            card.append(title, details);
             container.appendChild(card);
         });
 
@@ -453,7 +494,34 @@ async function loadWaitlist() {
             return;
         }
 
+        const groups = new Map();
         rows.forEach(patient => {
+            const key = patient.preferred_date || "any";
+            if (!groups.has(key)) groups.set(key, []);
+            groups.get(key).push(patient);
+        });
+
+        const dayKeys = [...groups.keys()].sort((a, b) =>
+            a === "any" ? 1 : b === "any" ? -1 : a.localeCompare(b)
+        );
+
+        dayKeys.forEach(dayKey => {
+            const dayRow = document.createElement("tr");
+            dayRow.className = "waitlist-day-row";
+            const dayHeading = document.createElement("th");
+            dayHeading.colSpan = 7;
+            if (dayKey === "any") {
+                dayHeading.textContent = "Any day · no date preference";
+            } else {
+                const dayDate = new Date(`${dayKey}T00:00:00`);
+                dayHeading.textContent = dayDate.toLocaleDateString(undefined, {
+                    weekday: "long", year: "numeric", month: "long", day: "numeric"
+                });
+            }
+            dayRow.appendChild(dayHeading);
+            tbody.appendChild(dayRow);
+
+            groups.get(dayKey).forEach(patient => {
 
             const tr = document.createElement("tr");
 
@@ -463,13 +531,21 @@ async function loadWaitlist() {
                 patient.doctor,
                 patient.preferred_date || "Not specified",
                 patient.preferred_time || "Not specified",
-                patient.status
+                patient.status === "offered" ? "Offer needs approval" :
+                    patient.status === "accepted" ? "Booked" : "Waiting"
             ];
 
-            values.forEach(value => {
+            values.forEach((value, index) => {
 
                 const td = document.createElement("td");
-                td.textContent = value;
+                if (index === 5) {
+                    const status = document.createElement("span");
+                    status.className = "pill" + (patient.status === "offered" ? " offered" : "");
+                    status.textContent = value;
+                    td.appendChild(status);
+                } else {
+                    td.textContent = value;
+                }
 
                 tr.appendChild(td);
             });
@@ -511,6 +587,7 @@ async function loadWaitlist() {
 
             tr.appendChild(action);
             tbody.appendChild(tr);
+            });
         });
 
     } catch (error) {
@@ -623,5 +700,6 @@ async function rejectWaitlist(id) {
 // ==============================
 
 load();
+loadDoctors();
 report();
 loadWaitlist();

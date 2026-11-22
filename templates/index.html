@@ -82,6 +82,7 @@
 
         <nav>
             <a class="active" href="#overview">▦ &nbsp; Overview</a>
+            <a href="#doctors">⚕ &nbsp; Doctors</a>
             <a href="#appointments">▣ &nbsp; Appointments</a>
             <a href="#agent">✧ &nbsp; AI Assistant</a>
             <a href="#reports">▤ &nbsp; Reports</a>
@@ -89,7 +90,7 @@
 
         <div class="side-note">
             <b>Demo environment</b>
-            <p>Uses fictional patient data. Reminders are simulated.</p>
+            <p>Uses fictional patient data. Reminders are simulated. The assistant never overbooks; any exception requires front-desk approval.</p>
         </div>
     </aside>
 
@@ -136,6 +137,19 @@
 
         </section>
 
+        <section class="panel" id="doctors">
+            <div class="panel-head">
+                <div>
+                    <p class="eyebrow">CLINIC DIRECTORY</p>
+                    <h2>Doctors by department</h2>
+                    <p class="muted">Three doctors are available in each department. Ask by name or specialty.</p>
+                </div>
+            </div>
+            <div id="doctorDirectory" class="doctor-grid" aria-live="polite">
+                <p class="muted">Loading doctors...</p>
+            </div>
+        </section>
+
         <!-- AI ASSISTANT -->
         <section class="panel" id="agent">
 
@@ -144,8 +158,9 @@
                     <p class="eyebrow">CARE SLOT AI</p>
                     <h2>Appointment assistant</h2>
                     <p class="muted">
-                        Try: “Book Dr. Kumar tomorrow at 2 PM for Rahul Sharma”
+                        Try: “Book Dr. Kumar tomorrow at 2:00 PM for Rahul Sharma”
                     </p>
+                    <p class="muted">Appointment times are shown in 12-hour format with AM or PM.</p>
                 </div>
 
                 <span class="online">● Demo agent online</span>
@@ -245,7 +260,7 @@
                     <p class="eyebrow">PATIENT COORDINATION</p>
                     <h2>Waitlist Management</h2>
                     <p class="muted">
-                        Manage patients waiting for appointments.
+                        Patients are grouped by their preferred day. If no day is chosen, they can take any day. A matching cancelled slot appears as an offer here for staff approval.
                     </p>
                 </div>
 
@@ -292,6 +307,9 @@
                 <button class="secondary" onclick="report()">
                     Refresh report
                 </button>
+                <label class="report-date-label" for="reportDate">Report day
+                    <input id="reportDate" type="date" aria-label="Report date">
+                </label>
             </div>
 
             <div id="reportBody" class="report-grid">
@@ -299,6 +317,8 @@
                     Load report to view explainable no-show risk estimates.
                 </p>
             </div>
+
+            <p id="reportNote" class="footnote"></p>
 
             <p class="footnote">
                 No-show risk is a transparent demonstration heuristic,
@@ -317,96 +337,6 @@
 
 <!-- EXISTING APPLICATION JAVASCRIPT -->
 <script src="/static/app.js"></script>
-
-<!-- VOICE RECOGNITION -->
-<script>
-document.addEventListener("DOMContentLoaded", function () {
-
-    const voiceButton = document.getElementById("voiceButton");
-    const messageInput = document.getElementById("message");
-    const voiceStatus = document.getElementById("voiceStatus");
-
-    const SpeechRecognition =
-        window.SpeechRecognition ||
-        window.webkitSpeechRecognition;
-
-    if (!SpeechRecognition) {
-        voiceButton.disabled = true;
-        voiceButton.textContent = "Voice unavailable";
-        voiceStatus.textContent =
-            "Speech recognition is not supported by this browser. Please use Chrome.";
-        return;
-    }
-
-    const recognition = new SpeechRecognition();
-
-    recognition.lang = "en-IN";
-    recognition.continuous = false;
-    recognition.interimResults = false;
-    recognition.maxAlternatives = 1;
-
-    let isListening = false;
-
-    voiceButton.addEventListener("click", function () {
-
-        if (isListening) {
-            recognition.stop();
-            return;
-        }
-
-        try {
-            recognition.start();
-        } catch (error) {
-            voiceStatus.textContent =
-                "Voice recognition could not start. Please try again.";
-        }
-    });
-
-    recognition.onstart = function () {
-        isListening = true;
-
-        voiceButton.textContent = "■ Stop";
-        voiceButton.classList.add("listening");
-
-        voiceStatus.textContent =
-            "🎙 Listening... Speak your appointment request.";
-    };
-
-    recognition.onresult = function (event) {
-
-        const transcript =
-            event.results[0][0].transcript;
-
-        messageInput.value = transcript;
-        messageInput.focus();
-
-        voiceStatus.textContent =
-            "Speech converted successfully. Review the text and click Send request.";
-    };
-
-    recognition.onerror = function (event) {
-
-        if (event.error === "not-allowed") {
-            voiceStatus.textContent =
-                "Microphone permission denied. Allow microphone access in your browser.";
-        } else if (event.error === "no-speech") {
-            voiceStatus.textContent =
-                "No speech detected. Please try speaking again.";
-        } else {
-            voiceStatus.textContent =
-                "Voice recognition error: " + event.error;
-        }
-    };
-
-    recognition.onend = function () {
-        isListening = false;
-
-        voiceButton.textContent = "🎙 Speak";
-        voiceButton.classList.remove("listening");
-    };
-
-});
-</script>
 
 </body>
 </html>

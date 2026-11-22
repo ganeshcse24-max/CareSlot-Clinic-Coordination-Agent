@@ -1,1002 +1,420 @@
-
-from flask import Flask, render_template, request, jsonify
-from psycopg2.extras import RealDictCursor
-from datetime import date, timedelta
+"""CareSlot clinic coordination demo (Flask + SQLite)."""
+from datetime import date, datetime, timedelta
 import re
-from db import get_connection
+import sqlite3
+
+from flask import Flask, jsonify, render_template, request
+from db import connection, init_db
 
 app = Flask(__name__)
+SLOT_TIMES = ("09:00", "10:00", "11:00", "12:00", "14:00", "15:00", "16:00")
 
 
-# ==========================================
-# DATABASE HELPER
-# ==========================================
+def json_body():
+    return request.get_json(silent=True) or {}
 
-def run_query(sql, params=(), fetch="all"):
-    conn = get_connection()
-
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(sql, params)
-
-            if fetch == "one":
-                result = cur.fetchone()
-            elif fetch == "none":
-                result = None
-            else:
-                result = cur.fetchall()
-
-        conn.commit()
-
-        if fetch == "none":
-            return None
-
-        return dict(result) if fetch == "one" and result else (
-            [dict(row) for row in result]
-            if fetch == "all" and result is not None else None
-        )
-
-    except Exception:
-        conn.rollback()
-        raise
-
-    finally:
-        conn.close()
-
-
-# ==========================================
-# SAMPLE DATA
-# ==========================================
-
-def init_sample_data():
-
-    for name, specialty in [
-        ("Dr. Kumar", "General Physician"),
-        ("Dr. Priya", "Dermatology"),
-        ("Dr. Shah", "Cardiology")
-    ]:
-        run_query(
-            "INSERT INTO doctors(name,specialty) "
-            "VALUES(%s,%s) ON CONFLICT(name) DO NOTHING",
-            (name, specialty),
-            "none"
-        )
-
-    for name, phone in [
-        ("Rahul Sharma", "9000000001"),
-        ("Ananya Rao", "9000000002"),
-        ("Aarav Nair", "9000000003"),
-        ("Meera Das", "9000000004")
-    ]:
-        run_query(
-            "INSERT INTO patients(name,phone) "
-            "VALUES(%s,%s) ON CONFLICT(phone) DO NOTHING",
-            (name, phone),
-            "none"
-        )
-
-
-# ==========================================
-# HELPER FUNCTIONS
-# ==========================================
 
 def find_doctor(text):
-
-    doctors = run_query(
-        "SELECT doctor_id,name FROM doctors WHERE available=TRUE"
-    )
-
-    lower = text.lower()
-
+    lower = text.casefold()
+    with connection() as conn:
+        doctors = conn.execute("SELECT doctor_id,name FROM doctors WHERE available=1").fetchall()
     for doctor in doctors:
-        if (
-            doctor["name"].lower() in lower
-            or doctor["name"].split()[-1].lower() in lower
-        ):
-            return doctor
-
+        surname = doctor["name"].split()[-1].casefold()
+        if doctor["name"].casefold() in lower or re.search(rf"\b{re.escape(surname)}\b", lower):
+            return dict(doctor)
     return None
+
+
+def doctor_choice_prompt(text):
+    lower = text.casefold()
+    aliases = {
+        "General Medicine": ("general", "family doctor", "gp"),
+        "Dermatology": ("dermat", "skin doctor", "skin specialist"),
+        "Cardiology": ("cardio", "heart doctor", "heart specialist"),
+    }
+    with connection() as conn:
+        rows = conn.execute("SELECT name,specialty FROM doctors WHERE available=1 ORDER BY specialty,name").fetchall()
+    for specialty, terms in aliases.items():
+        if any(term in lower for term in terms):
+            names = [row["name"] for row in rows if row["specialty"] == specialty]
+            return f"I found {specialty}. Which doctor would you prefer: {', '.join(names)}?"
+    groups = {}
+    for row in rows:
+        groups.setdefault(row["specialty"], []).append(row["name"])
+    return "Which doctor would you prefer? " + "; ".join(
+        f"{department}: {', '.join(names)}" for department, names in groups.items()
+    ) + "."
 
 
 def requested_date(text):
-
-    lower = text.lower()
-
+    lower = text.casefold()
+    today = date.today()
+    iso_date = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", lower)
+    if iso_date:
+        try:
+            return date.fromisoformat(iso_date[1])
+        except ValueError:
+            pass
     if "day after tomorrow" in lower:
-        return date.today() + timedelta(days=2)
-
+        return today + timedelta(days=2)
     if "tomorrow" in lower:
-        return date.today() + timedelta(days=1)
+        return today + timedelta(days=1)
+    if "today" in lower:
+        return today
+    weekdays = {"monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+                "friday": 4, "saturday": 5, "sunday": 6}
+    for name, weekday in weekdays.items():
+        if re.search(rf"\b(?:next\s+)?{name}\b", lower):
+            days_ahead = (weekday - today.weekday()) % 7
+            if days_ahead == 0 or re.search(rf"\bnext\s+{name}\b", lower):
+                days_ahead += 7
+            return today + timedelta(days=days_ahead)
+    return today
 
-    return date.today()
 
-
-def available_slots(doctor_id, day):
-
-    rows = run_query(
-        """
-        SELECT appointment_time
-        FROM appointments
-        WHERE doctor_id=%s
-        AND appointment_date=%s
-        AND status='booked'
-        """,
-        (doctor_id, day)
-    )
-
-    booked = {
-        row["appointment_time"].strftime("%H:%M")
-        for row in rows
-    }
-
-    return [
-        t for t in [
-            "09:00", "10:00", "11:00",
-            "12:00", "14:00", "15:00", "16:00"
-        ]
-        if t not in booked
-    ]
-
+def has_explicit_date(text):
+    lower = text.casefold()
+    return bool(re.search(r"\b(?:today|tomorrow|day after tomorrow|next\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b|\b20\d{2}-\d{2}-\d{2}\b", lower)) or "today" in lower or "tomorrow" in lower
 
 
 def parse_time(text):
-    # Convert spoken time formats such as p.m. and a.m.
-    text = text.lower().strip()
-
-    text = re.sub(
-        r"\b([ap])\s*\.?\s*m\.?\b",
-        r"\1m",
-        text
-    )
-
-    # Match 2 PM, 2:00 PM, 2 p.m., etc.
-    match = re.search(
-        r"\b(9|10|11|12|1|2|3|4)(?::([0-5]\d))?\s*(am|pm)\b",
-        text
-    )
-
+    text = re.sub(r"\b([ap])\s*\.?\s*m\.?\b", r"\1m", text.casefold())
+    text = re.sub(r"\b(noon|midday)\b", "12 pm", text)
+    text = re.sub(r"\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\b", lambda m: str({"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12}[m[1]]), text)
+    match = re.search(r"\b(9|10|11|12|1|2|3|4)(?::([0-5]\d))?\s*(am|pm)\b", text)
     if match:
-        hour = int(match.group(1))
-        minute = int(match.group(2) or 0)
-        period = match.group(3)
-
+        hour, minute, period = int(match[1]), int(match[2] or 0), match[3]
         if period == "pm" and hour != 12:
             hour += 12
-
         elif period == "am" and hour == 12:
             hour = 0
-
         return f"{hour:02d}:{minute:02d}"
-
-    # Match 24-hour format such as 14:00
-    match = re.search(
-        r"\b(09|10|11|12|14|15|16):([0-5]\d)\b",
-        text
-    )
-
+    match = re.search(r"\b(?:at|around|about)\s+(9|10|11|12|1|2|3|4)(?::([0-5]\d))?\b", text)
     if match:
-        return f"{match.group(1)}:{match.group(2)}"
+        hour, minute = int(match[1]), int(match[2] or 0)
+        if hour in (1, 2, 3, 4):
+            hour += 12
+        return f"{hour:02d}:{minute:02d}"
+    match = re.search(r"\b(09|10|11|12|14|15|16):([0-5]\d)\b", text)
+    if match:
+        return f"{match[1]}:{match[2]}"
+    # Accept shorthand such as "make it 16" as 4 PM when the caller
+    # already has the selected clinic slot in context.
+    match = re.search(r"\b(?:at|on|make it|make)\s*(14|15|16)\b", text)
+    return f"{match[1]}:00" if match else None
 
-    return None
 
+def display_time(value):
+    """Render internal HH:MM values as clear 12-hour times."""
+    if not value:
+        return None
+    return datetime.strptime(value, "%H:%M").strftime("%I:%M %p").lstrip("0")
+
+
+def conversation_context(doctor, day):
+    return {"doctor": doctor["name"], "date": day.isoformat()} if doctor else None
+
+
+def available_slots(doctor_id, day, exclude_id=None):
+    sql = "SELECT appointment_time FROM appointments WHERE doctor_id=? AND appointment_date=? AND status='booked'"
+    params = [doctor_id, day.isoformat() if isinstance(day, date) else day]
+    if exclude_id is not None:
+        sql += " AND appointment_id<>?"
+        params.append(exclude_id)
+    with connection() as conn:
+        booked = {row[0] for row in conn.execute(sql, params)}
+    return [slot for slot in SLOT_TIMES if slot not in booked]
+
+
+def get_or_create_patient(conn, name):
+    name = " ".join(name.split())
+    if not name or len(name) > 100:
+        raise ValueError("Please provide a valid patient name (up to 100 characters).")
+    conn.execute("INSERT OR IGNORE INTO patients(name) VALUES(?)", (name,))
+    return conn.execute("SELECT patient_id FROM patients WHERE name=? COLLATE NOCASE", (name,)).fetchone()[0]
 
 
 def risk_score(attended_before, lead_days):
-
     score, reasons = 20, []
-
     if not attended_before:
         score += 45
         reasons.append("previous missed appointment")
-
     if lead_days >= 7:
         score += 20
         reasons.append("booked 7 or more days in advance")
-
     elif lead_days >= 4:
         score += 10
         reasons.append("booked several days in advance")
-
-    return (
-        min(score, 95),
-        ", ".join(reasons) if reasons
-        else "no major demo risk factors"
-    )
+    return min(score, 95), ", ".join(reasons) if reasons else "no major demo risk factors"
 
 
-# ==========================================
-# HOME
-# ==========================================
-
-@app.route("/")
+@app.get("/")
 def home():
     return render_template("index.html")
 
 
-# ==========================================
-# WAITLIST API
-# ==========================================
-
-@app.route("/api/waitlist")
-def get_waitlist():
-
-    rows = run_query("""
-        SELECT
-            w.waitlist_id,
-            p.name AS patient,
-            d.name AS doctor,
-            w.preferred_date,
-            w.preferred_time,
-            w.status
-        FROM waitlist w
-        JOIN patients p ON w.patient_id = p.patient_id
-        JOIN doctors d ON w.doctor_id = d.doctor_id
-        ORDER BY w.created_at DESC
-    """)
-
-    for row in rows:
-
-        row["preferred_date"] = (
-            row["preferred_date"].isoformat()
-            if row["preferred_date"] else None
-        )
-
-        row["preferred_time"] = (
-            row["preferred_time"].strftime("%H:%M")
-            if row["preferred_time"] else None
-        )
-
-    return jsonify({"waitlist": rows})
-
-
-# ==========================================
-# APPROVE WAITLIST OFFER
-# ==========================================
-
-@app.route("/api/waitlist/<int:wid>/approve", methods=["POST"])
-def approve_waitlist(wid):
-
-    patient = run_query("""
-        SELECT
-            waitlist_id,
-            patient_id,
-            doctor_id,
-            preferred_date,
-            preferred_time
-        FROM waitlist
-        WHERE waitlist_id = %s
-        AND status = 'offered'
-    """, (wid,), "one")
-
-    if not patient:
-        return jsonify({
-            "message": "No active offered waitlist entry found."
-        }), 404
-
-    if not patient["preferred_date"] or not patient["preferred_time"]:
-        return jsonify({
-            "message": "The offered appointment date or time is missing."
-        }), 400
-
-    # Check whether the slot is still available
-    slots = available_slots(
-        patient["doctor_id"],
-        patient["preferred_date"]
-    )
-
-    slot = patient["preferred_time"].strftime("%H:%M")
-
-    if slot not in slots:
-        return jsonify({
-            "message": "This appointment slot is no longer available."
-        }), 409
-
-    lead = max(
-        0,
-        (patient["preferred_date"] - date.today()).days
-    )
-
-    # Create confirmed appointment
-    try:
-        booking = run_query("""
-            INSERT INTO appointments(
-                patient_id,
-                doctor_id,
-                appointment_date,
-                appointment_time,
-                booking_lead_days
-            )
-            VALUES(%s,%s,%s,%s,%s)
-            RETURNING appointment_id
-        """, (
-            patient["patient_id"],
-            patient["doctor_id"],
-            patient["preferred_date"],
-            patient["preferred_time"],
-            lead
-        ), "one")
-
-    except Exception as e:
-
-        if (
-            "unique_active_doctor_slot" in str(e)
-            or "duplicate key" in str(e)
-        ):
-            return jsonify({
-                "message": "This appointment slot has already been booked."
-            }), 409
-
-        raise
-
-    # Mark waitlist entry as accepted
-    run_query("""
-        UPDATE waitlist
-        SET status = 'accepted'
-        WHERE waitlist_id = %s
-        AND status = 'offered'
-    """, (wid,), "none")
-
-    return jsonify({
-        "message": (
-            f"Appointment approved successfully! "
-            f"New appointment ID: #{booking['appointment_id']}."
-        )
-    })
-
-
-# ==========================================
-# REJECT WAITLIST OFFER
-# ==========================================
-
-@app.route("/api/waitlist/<int:wid>/reject", methods=["POST"])
-def reject_waitlist(wid):
-
-    result = run_query("""
-        UPDATE waitlist
-        SET status = 'waiting',
-            preferred_time = NULL
-        WHERE waitlist_id = %s
-        AND status = 'offered'
-        RETURNING waitlist_id
-    """, (wid,), "one")
-
-    if not result:
-        return jsonify({
-            "message": "No active offered waitlist entry found."
-        }), 404
-
-    return jsonify({
-        "message": (
-            "Offer rejected. Patient returned to the waiting list."
-        )
-    })
-
-
-# ==========================================
-# DASHBOARD API
-# ==========================================
-
-@app.route("/api/dashboard")
+@app.get("/api/dashboard")
 def dashboard():
-
-    rows = run_query("""
-        SELECT
-            a.appointment_id AS id,
-            a.appointment_date,
-            a.appointment_time,
-            a.status,
-            p.name AS patient,
-            d.name AS doctor,
-            d.specialty
-        FROM appointments a
-        JOIN patients p ON p.patient_id = a.patient_id
-        JOIN doctors d ON d.doctor_id = a.doctor_id
-        ORDER BY a.appointment_date, a.appointment_time
-    """)
-
-    appointments = []
-
-    for r in rows:
-        r["appt_date"] = r.pop("appointment_date").isoformat()
-        r["appt_time"] = r.pop("appointment_time").strftime("%H:%M")
-        appointments.append(r)
-
-    waiting = run_query(
-        "SELECT COUNT(*) AS n FROM waitlist WHERE status='waiting'",
-        fetch="one"
-    )["n"]
-
+    with connection() as conn:
+        rows = conn.execute("""SELECT a.appointment_id AS id,a.appointment_date AS appt_date,
+            a.appointment_time AS appt_time,a.status,p.name AS patient,d.name AS doctor,d.specialty
+            FROM appointments a JOIN patients p USING(patient_id) JOIN doctors d USING(doctor_id)
+            ORDER BY a.appointment_date,a.appointment_time""").fetchall()
+        waiting = conn.execute("SELECT COUNT(*) FROM waitlist WHERE status='waiting'").fetchone()[0]
+    appointments = [dict(row) for row in rows]
+    for appointment in appointments:
+        appointment["appt_time"] = display_time(appointment["appt_time"])
     today = date.today().isoformat()
-
-    return jsonify({
-        "appointments": appointments,
-        "total": sum(
-            1 for a in appointments
-            if a["appt_date"] >= today and a["status"] == "booked"
-        ),
-        "booked": sum(
-            1 for a in appointments if a["status"] == "booked"
-        ),
-        "cancelled": sum(
-            1 for a in appointments if a["status"] == "cancelled"
-        ),
-        "waitlist": waiting
-    })
+    return jsonify(appointments=appointments,
+                   total=sum(a["appt_date"] >= today and a["status"] == "booked" for a in appointments),
+                   booked=sum(a["status"] == "booked" for a in appointments),
+                   cancelled=sum(a["status"] == "cancelled" for a in appointments), waitlist=waiting)
 
 
-# ==========================================
-# CHAT API
-# ==========================================
+@app.get("/api/doctors")
+def doctors_directory():
+    with connection() as conn:
+        rows = conn.execute("SELECT doctor_id,name,specialty FROM doctors WHERE available=1 ORDER BY specialty,name").fetchall()
+    return jsonify(doctors=[dict(row) for row in rows])
 
-@app.route("/api/chat", methods=["POST"])
+
+@app.get("/api/waitlist")
+def get_waitlist():
+    with connection() as conn:
+        rows = conn.execute("""SELECT w.waitlist_id,p.name AS patient,d.name AS doctor,
+            CASE WHEN w.status IN ('offered','accepted') THEN COALESCE(w.offered_date,w.preferred_date) ELSE w.preferred_date END AS preferred_date,
+            CASE WHEN w.status IN ('offered','accepted') THEN COALESCE(w.offered_time,w.preferred_time) ELSE w.preferred_time END AS preferred_time,
+            w.status FROM waitlist w
+            JOIN patients p USING(patient_id) JOIN doctors d USING(doctor_id)
+            ORDER BY w.created_at DESC,w.waitlist_id DESC""").fetchall()
+    entries = [dict(row) for row in rows]
+    for entry in entries:
+        entry["preferred_time"] = display_time(entry["preferred_time"])
+    return jsonify(waitlist=entries)
+
+
+@app.post("/api/waitlist/<int:wid>/approve")
+def approve_waitlist(wid):
+    try:
+        with connection() as conn:
+            item = conn.execute("SELECT * FROM waitlist WHERE waitlist_id=? AND status='offered'", (wid,)).fetchone()
+            if not item:
+                return jsonify(message="No active offered waitlist entry found."), 404
+            day = item["offered_date"] or item["preferred_date"]
+            slot = item["offered_time"] or item["preferred_time"]
+            if not day or not slot:
+                return jsonify(message="The offered appointment date or time is missing."), 400
+            conn.execute("INSERT INTO appointments(patient_id,doctor_id,appointment_date,appointment_time,booking_lead_days) VALUES(?,?,?,?,?)",
+                         (item["patient_id"], item["doctor_id"], day, slot, max(0, (date.fromisoformat(day)-date.today()).days)))
+            appointment_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            conn.execute("UPDATE waitlist SET status='accepted' WHERE waitlist_id=?", (wid,))
+        return jsonify(message=f"Appointment approved successfully! New appointment ID: #{appointment_id}.")
+    except sqlite3.IntegrityError:
+        return jsonify(message="This appointment slot has just been booked. Please choose another time."), 409
+
+
+@app.post("/api/waitlist/<int:wid>/reject")
+def reject_waitlist(wid):
+    with connection() as conn:
+        cur = conn.execute("UPDATE waitlist SET status='waiting',offered_date=NULL,offered_time=NULL WHERE waitlist_id=? AND status='offered'", (wid,))
+        if not cur.rowcount:
+            return jsonify(message="No active offered waitlist entry found."), 404
+    return jsonify(message="Offer rejected. Patient returned to the waiting list.")
+
+
+@app.post("/api/chat")
 def chat():
-
-    message = (request.json or {}).get("message", "").strip()
-
-    if not message:
-        return jsonify({"reply": "Please enter a request."})
-
-    lower = message.lower()
-    doctor = find_doctor(message)
-    day = requested_date(message)
-
-    # CHECK AVAILABILITY
-    if any(w in lower for w in [
-        "available", "availability", "free slot", "slots"
-    ]):
-
-        if not doctor:
-            return jsonify({
-                "reply": "Which doctor? Try Dr. Kumar, Dr. Priya or Dr. Shah."
-            })
-
-        slots = available_slots(doctor["doctor_id"], day)
-
-        return jsonify({
-            "reply": (
-                f"{doctor['name']} has these available slots on {day}: "
-                f"{', '.join(slots) if slots else 'No slots available'}."
-            ),
-            "action": "availability"
-        })
-
-    
-    # JOIN WAITLIST
-    if "waitlist" in lower or "waiting list" in lower:
-
-        if not doctor:
-            return jsonify({
-                "reply": "Which doctor's waitlist? Try Dr. Kumar, Dr. Priya or Dr. Shah."
-            })
-
-        # Extract patient's name
-        m = re.search(
-            r"(?:name is|i am|i'm)\s+([A-Za-z]+(?:\s+[A-Za-z]+)*?)(?=\s+(?:for|tomorrow|today|at)\b|[.,!?]*$)",
-            message,
-            re.I
-        )
-
-        if not m:
-            return jsonify({
-                "reply": (
-                    "Please provide your name. Example: "
-                    "Join Dr. Kumar's waitlist. My name is Rahul Sharma."
-                )
-            })
-
-        pname = m.group(1).strip()
-
-        # Extract preferred appointment time
-        preferred_time = parse_time(message)
-
-        # Find or create patient
-        patient = run_query(
-            "SELECT patient_id FROM patients WHERE lower(name)=lower(%s)",
-            (pname,),
-            "one"
-        )
-
-        if not patient:
-            patient = run_query(
-                "INSERT INTO patients(name) VALUES(%s) RETURNING patient_id",
-                (pname,),
-                "one"
-            )
-
-        # Add patient with preferred date and time
-        run_query("""
-            INSERT INTO waitlist(
-                patient_id,
-                doctor_id,
-                preferred_date,
-                preferred_time
-            )
-            VALUES(%s,%s,%s,%s)
-        """, (
-            patient["patient_id"],
-            doctor["doctor_id"],
-            day,
-            preferred_time
-        ), "none")
-
-        time_message = (
-            f" at {preferred_time}"
-            if preferred_time
-            else " (no specific time requested)"
-        )
-
-        return jsonify({
-            "reply": (
-                f"{pname} has been added to {doctor['name']}'s "
-                f"waitlist for {day}{time_message}. "
-                f"This is simulated."
-            ),
-            "action": "waitlist"
-        })
-
-
-    
-    # CANCEL APPOINTMENT AND OFFER SLOT
-    if "cancel" in lower:
-
-        m = re.search(
-            r"(?:appointment\s*)?#?\s*(\d+)",
-            lower
-        )
-
-        if not m:
-            return jsonify({
-                "reply": (
-                    "Please include an appointment ID, "
-                    "for example: cancel appointment 2."
-                )
-            })
-
-        aid = int(m.group(1))
-
-        appointment = run_query("""
-            SELECT
-                appointment_id,
-                doctor_id,
-                appointment_date,
-                appointment_time
-            FROM appointments
-            WHERE appointment_id = %s
-            AND status = 'booked'
-        """, (aid,), "one")
-
-        if not appointment:
-            return jsonify({
-                "reply": f"No active appointment #{aid} found."
-            })
-
-        run_query("""
-            UPDATE appointments
-            SET status = 'cancelled'
-            WHERE appointment_id = %s
-        """, (aid,), "none")
-
-        # PRIORITY-BASED WAITLIST MATCHING
-        # 1. Exact preferred time
-        # 2. No preferred time specified
-        # 3. Earlier waitlist entry wins when priorities are equal
-
-        waiting_patient = run_query("""
-            SELECT waitlist_id, patient_id
-            FROM waitlist
-            WHERE doctor_id = %s
-            AND preferred_date = %s
-            AND status = 'waiting'
-            AND (
-                preferred_time IS NULL
-                OR preferred_time = %s
-            )
-            ORDER BY
-                CASE
-                    WHEN preferred_time = %s THEN 0
-                    WHEN preferred_time IS NULL THEN 1
-                    ELSE 2
-                END,
-                created_at ASC,
-                waitlist_id ASC
-            LIMIT 1
-        """, (
-            appointment["doctor_id"],
-            appointment["appointment_date"],
-            appointment["appointment_time"],
-            appointment["appointment_time"]
-        ), "one")
-
-        if waiting_patient:
-
-            # Save the exact offered appointment slot
-            run_query("""
-                UPDATE waitlist
-                SET status = 'offered',
-                    preferred_date = %s,
-                    preferred_time = %s
-                WHERE waitlist_id = %s
-            """, (
-                appointment["appointment_date"],
-                appointment["appointment_time"],
-                waiting_patient["waitlist_id"]
-            ), "none")
-
-            patient = run_query("""
-                SELECT name
-                FROM patients
-                WHERE patient_id = %s
-            """, (waiting_patient["patient_id"],), "one")
-
-            return jsonify({
-                "reply": (
-                    f"Appointment #{aid} cancelled successfully. "
-                    f"The available slot has been offered to "
-                    f"{patient['name']} from the waitlist. "
-                    f"Front-desk confirmation is required."
-                ),
-                "action": "cancel",
-                "waitlist_action": "offered"
-            })
-
-        return jsonify({
-            "reply": (
-                f"Appointment #{aid} cancelled successfully. "
-                "No matching patient was found in the waitlist."
-            ),
-            "action": "cancel"
-        })
-
-
-    # RESCHEDULE APPOINTMENT THROUGH CHAT
-    if "reschedule" in lower or "change appointment" in lower:
-
-        m = re.search(
-            r"appointment\s*#?\s*(\d+)",
-            lower
-        )
-
-        if not m:
-            return jsonify({
-                "reply": "Please provide the appointment ID. Example: Reschedule appointment 2 to tomorrow at 11 AM."
-            })
-
-        aid = int(m.group(1))
-
-        # Find existing active appointment
-        appointment = run_query("""
-            SELECT appointment_id, doctor_id,
-                   appointment_date, appointment_time
-            FROM appointments
-            WHERE appointment_id = %s
-            AND status = 'booked'
-        """, (aid,), "one")
-
-        if not appointment:
-            return jsonify({
-                "reply": f"Active appointment #{aid} was not found."
-            })
-
-        # Extract new date and time
-        new_date = requested_date(message)
-        new_time = parse_time(message)
-
-        if not new_time:
-            return jsonify({
-                "reply": "Please specify the new time, for example: Reschedule appointment 2 to tomorrow at 11 AM."
-            })
-
-        # Check availability
-        slots = available_slots(
-            appointment["doctor_id"],
-            new_date
-        )
-
-        if new_time not in slots:
-            return jsonify({
-                "reply": (
-                    f"{new_time} is not available on {new_date}. "
-                    f"Available slots: "
-                    f"{', '.join(slots) if slots else 'none'}."
-                )
-            })
-
-        # Update appointment
-        new_lead = max(
-            0,
-            (new_date - date.today()).days
-        )
-
-        try:
-            run_query("""
-                UPDATE appointments
-                SET appointment_date = %s,
-                    appointment_time = %s,
-                    booking_lead_days = %s
-                WHERE appointment_id = %s
-            """, (
-                new_date,
-                new_time,
-                new_lead,
-                aid
-            ), "none")
-
-        except Exception as e:
-            if "duplicate key" in str(e):
-                return jsonify({
-                    "reply": "That slot has just been booked. Please choose another time."
-                })
-            raise
-
-        return jsonify({
-            "reply": (
-                f"Appointment #{aid} rescheduled successfully! "
-                f"Your new appointment is on {new_date} "
-                f"at {new_time}."
-            ),
-            "action": "reschedule"
-        })
-
-    # BOOK APPOINTMENT
-    if any(w in lower for w in [
-        "book", "appointment", "schedule"
-    ]):
-
-        if not doctor:
-            return jsonify({
-                "reply": "Which doctor? Mention Dr. Kumar, Dr. Priya or Dr. Shah."
-            })
-
-        appt_time = parse_time(message)
-
-        if not appt_time:
-            slots = available_slots(doctor["doctor_id"], day)
-
-            return jsonify({
-                "reply": (
-                    f"Please specify a time. Available for {doctor['name']} "
-                    f"on {day}: {', '.join(slots) if slots else 'none'}."
-                )
-            })
-
-        slots = available_slots(doctor["doctor_id"], day)
-
-        if appt_time not in slots:
-            return jsonify({
-                "reply": (
-                    f"{appt_time} is not available with {doctor['name']} "
-                    f"on {day}. Available: "
-                    f"{', '.join(slots) if slots else 'none'}."
-                )
-            })
-
-        m = re.search(
-            r"(?:name is|i am|i'm|for)\s+([A-Za-z ]+?)(?:\s+(?:tomorrow|today|at)\b|[.,!?]*$)",
-            message,
-            re.I
-        )
-
-        pname = m.group(1).strip() if m else "Demo Patient"
-
-        patient = run_query(
-            "SELECT patient_id FROM patients WHERE lower(name)=lower(%s)",
-            (pname,),
-            "one"
-        )
-
-        if not patient:
-            patient = run_query(
-                "INSERT INTO patients(name) VALUES(%s) RETURNING patient_id",
-                (pname,),
-                "one"
-            )
-
-        lead = max(0, (day - date.today()).days)
-
-        try:
-            booking = run_query("""
-                INSERT INTO appointments(
-                    patient_id,
-                    doctor_id,
-                    appointment_date,
-                    appointment_time,
-                    booking_lead_days
-                )
-                VALUES(%s,%s,%s,%s,%s)
-                RETURNING appointment_id
-            """, (
-                patient["patient_id"],
-                doctor["doctor_id"],
-                day,
-                appt_time,
-                lead
-            ), "one")
-
-        except Exception as e:
-
-            if (
-                "unique_active_doctor_slot" in str(e)
-                or "duplicate key" in str(e)
-            ):
-                return jsonify({
-                    "reply": "That slot was just booked. Please choose another time."
-                })
-
-            raise
-
-        return jsonify({
-            "reply": (
-                f"Appointment confirmed! Booking ID "
-                f"#{booking['appointment_id']}: {pname} with "
-                f"{doctor['name']} on {day} at {appt_time}."
-            ),
-            "action": "book"
-        })
-
-    return jsonify({
-        "reply": (
-            "I can check availability, book, cancel and add "
-            "patients to a waitlist. Example: Book Dr. Kumar "
-            "tomorrow at 2 PM for Rahul Sharma."
-        )
-    })
-
-
-# ==========================================
-# SIMULATED REMINDER
-# ==========================================
-
-@app.route("/api/remind/<int:aid>", methods=["POST"])
-def remind(aid):
-
-    a = run_query("""
-        SELECT
-            a.appointment_id,
-            p.name AS patient,
-            d.name AS doctor,
-            a.appointment_date,
-            a.appointment_time
-        FROM appointments a
-        JOIN patients p ON p.patient_id = a.patient_id
-        JOIN doctors d ON d.doctor_id = a.doctor_id
-        WHERE a.appointment_id = %s
-        AND a.status = 'booked'
-    """, (aid,), "one")
-
-    if not a:
-        return jsonify({
-            "ok": False,
-            "message": "Active appointment not found."
-        }), 404
-
-    msg = (
-        f"Reminder for {a['patient']}: appointment with "
-        f"{a['doctor']} on {a['appointment_date']} "
-        f"at {a['appointment_time']}."
+    message = json_body().get("message", "")
+    if not isinstance(message, str) or not message.strip():
+        return jsonify(reply="Please enter a request."), 400
+    message = message.strip()
+    if len(message) > 500:
+        return jsonify(reply="Please keep requests under 500 characters."), 400
+    lower, day, doctor = message.casefold(), requested_date(message), find_doctor(message)
+
+    if re.fullmatch(r"(?:hi|hello|hey|good\s+morning|good\s+afternoon|good\s+evening|good\s+day)[!. ,]*", lower):
+        return jsonify(reply="Hello! I can help you find a doctor, check appointment times, or book a visit. What would you like to do?")
+
+    asks_availability = any(word in lower for word in ("available", "availability", "free slot", "slots")) or (
+        "free" in lower and ("doctor" in lower or doctor is not None)
     )
+    if asks_availability:
+        if not doctor:
+            return jsonify(reply=doctor_choice_prompt(message))
+        slots = available_slots(doctor["doctor_id"], day)
+        shown_slots = ", ".join(display_time(slot) for slot in slots)
+        return jsonify(reply=f"{doctor['name']} has these available slots on {day}: {shown_slots if slots else 'No slots available'}.", action="availability", context=conversation_context(doctor, day))
 
-    run_query("""
-        INSERT INTO reminders(
-            appointment_id,
-            message,
-            delivery_status
-        )
-        VALUES(%s,%s,'simulated')
-    """, (aid, msg), "none")
+    if "waitlist" in lower or "waiting list" in lower:
+        if not doctor:
+            return jsonify(reply="Which doctor's waitlist? Choose a doctor from the clinic directory below.")
+        match = re.search(r"(?:name is|i am|i'm)\s+([A-Za-z]+(?:\s+[A-Za-z]+)*?)(?=\s+(?:for|tomorrow|today|at)\b|[.,!?]*$)", message, re.I)
+        if not match:
+            match = re.search(r"\b(?:add|put|place)\s+(?!me\b|myself\b)([A-Za-z]+(?:\s+[A-Za-z]+)*?)\s+(?:to|on)\s+(?=dr\.?\s)", message, re.I)
+        if not match:
+            return jsonify(reply="Who should I add? For example: ‘Join Dr. Kumar’s waitlist. My name is Rahul Sharma.’ You can also include a day and time.")
+        name, slot = match[1].strip(), parse_time(message)
+        preferred_date = day.isoformat() if has_explicit_date(message) else None
+        with connection() as conn:
+            pid = get_or_create_patient(conn, name)
+            conn.execute("INSERT INTO waitlist(patient_id,doctor_id,preferred_date,preferred_time) VALUES(?,?,?,?)", (pid, doctor["doctor_id"], preferred_date, slot))
+        when = f"for {preferred_date}" if preferred_date else "for any day"
+        when += f" at {display_time(slot)}" if slot else ""
+        return jsonify(reply=f"{name} has been added to {doctor['name']}'s waitlist {when}. If a matching slot opens, it will appear here for staff approval.", action="waitlist")
 
-    return jsonify({
-        "ok": True,
-        "message": "SIMULATED reminder: " + msg
-    })
+    if "cancel" in lower:
+        match = re.search(r"(?:appointment\s*)?#?\s*(\d+)", lower)
+        if not match:
+            return jsonify(reply="Please include an appointment ID, for example: cancel appointment 2.")
+        aid = int(match[1])
+        with connection() as conn:
+            appointment = conn.execute("SELECT * FROM appointments WHERE appointment_id=? AND status='booked'", (aid,)).fetchone()
+            if not appointment:
+                return jsonify(reply=f"No active appointment #{aid} found.")
+            doctor_name = conn.execute("SELECT name FROM doctors WHERE doctor_id=?", (appointment["doctor_id"],)).fetchone()[0]
+            conn.execute("UPDATE appointments SET status='cancelled' WHERE appointment_id=?", (aid,))
+            waiting = conn.execute("""SELECT waitlist_id,patient_id FROM waitlist WHERE doctor_id=?
+                AND (preferred_date IS NULL OR preferred_date=?) AND status='waiting'
+                AND (preferred_time IS NULL OR preferred_time=?)
+                ORDER BY CASE WHEN preferred_time=? THEN 0 ELSE 1 END,created_at,waitlist_id LIMIT 1""",
+                (appointment["doctor_id"], appointment["appointment_date"], appointment["appointment_time"], appointment["appointment_time"])).fetchone()
+            patient_name = None
+            if waiting:
+                conn.execute("UPDATE waitlist SET status='offered',offered_date=?,offered_time=? WHERE waitlist_id=?", (appointment["appointment_date"], appointment["appointment_time"], waiting["waitlist_id"]))
+                patient_name = conn.execute("SELECT name FROM patients WHERE patient_id=?", (waiting["patient_id"],)).fetchone()[0]
+        if patient_name:
+            return jsonify(reply=f"Appointment #{aid} cancelled. The {display_time(appointment['appointment_time'])} slot on {appointment['appointment_date']} with {doctor_name} was offered to {patient_name}. Review and approve the offer in Waitlist Management.", action="cancel", waitlist_action="offered")
+        return jsonify(reply=f"Appointment #{aid} with {doctor_name} was cancelled. No one is waiting for this doctor and date at {display_time(appointment['appointment_time'])}. Waitlist offers must match the doctor; patients with no preferred day can match any date.", action="cancel")
+
+    asks_to_reschedule = any(phrase in lower for phrase in (
+        "reschedule", "change appointment", "change my appointment",
+        "move appointment", "move my appointment", "shift appointment",
+        "postpone appointment", "change the appointment time",
+    ))
+    if asks_to_reschedule:
+        match = re.search(r"appointment\s*#?\s*(\d+)", lower)
+        if not match:
+            return jsonify(reply="Please provide an appointment ID, for example: Reschedule appointment 2 to tomorrow at 11 AM.")
+        aid, slot = int(match[1]), parse_time(message)
+        if not slot:
+            return jsonify(reply="Please specify the new time, for example: Reschedule appointment 2 to tomorrow at 11 AM.")
+        try:
+            with connection() as conn:
+                appt = conn.execute("SELECT doctor_id FROM appointments WHERE appointment_id=? AND status='booked'", (aid,)).fetchone()
+                if not appt:
+                    return jsonify(reply=f"Active appointment #{aid} was not found.")
+                if slot not in available_slots(appt["doctor_id"], day, aid):
+                    slots = available_slots(appt["doctor_id"], day, aid)
+                    return jsonify(reply=f"{display_time(slot)} is not available on {day}. Available slots: {', '.join(display_time(value) for value in slots) if slots else 'none'}.")
+                conn.execute("UPDATE appointments SET appointment_date=?,appointment_time=?,booking_lead_days=? WHERE appointment_id=?", (day.isoformat(), slot, max(0,(day-date.today()).days),aid))
+        except sqlite3.IntegrityError:
+            return jsonify(reply="That slot has just been booked. Please choose another time.")
+        return jsonify(reply=f"Appointment #{aid} rescheduled to {day} at {display_time(slot)}.", action="reschedule")
+
+    if any(word in lower for word in ("book", "appointment", "schedule")):
+        if not doctor:
+            return jsonify(reply=doctor_choice_prompt(message) + " You can reply with a name, then tell me a day and time.")
+        slot = parse_time(message)
+        slots = available_slots(doctor["doctor_id"], day)
+        if not slot:
+            return jsonify(reply=f"What time works for you? For {doctor['name']} on {day}, available times are: {', '.join(display_time(value) for value in slots) if slots else 'none'}.", context=conversation_context(doctor, day))
+        if slot not in slots:
+            return jsonify(reply=f"{display_time(slot)} is not available with {doctor['name']} on {day}. Available times: {', '.join(display_time(value) for value in slots) if slots else 'none'}.", context=conversation_context(doctor, day))
+        match = re.search(r"(?:name is|i am|i'm|for)\s+([A-Za-z]+(?:\s+[A-Za-z]+)*?)(?=\s+(?:tomorrow|today|at)\b|[.,!?]*$)", message, re.I)
+        name = match[1].strip() if match else "Demo Patient"
+        try:
+            with connection() as conn:
+                pid = get_or_create_patient(conn, name)
+                conn.execute("INSERT INTO appointments(patient_id,doctor_id,appointment_date,appointment_time,booking_lead_days) VALUES(?,?,?,?,?)", (pid,doctor["doctor_id"],day.isoformat(),slot,max(0,(day-date.today()).days)))
+                aid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        except sqlite3.IntegrityError:
+            return jsonify(reply="That slot was just booked. Please choose another time.")
+        return jsonify(reply=f"Appointment confirmed! Booking ID #{aid}: {name} with {doctor['name']} on {day} at {display_time(slot)}.", action="book")
+
+    if doctor:
+        return jsonify(reply=f"{doctor['name']} works in {doctor['specialty']}. Would you like to check availability or book an appointment?", context=conversation_context(doctor, day))
+    return jsonify(reply="I can check availability, book, cancel, reschedule, or add patients to a waitlist. Tell me what you need in your own words, such as ‘Can I see a skin doctor tomorrow?’")
 
 
-# ==========================================
-# DAILY REPORT
-# ==========================================
+@app.post("/api/remind/<int:aid>")
+def remind(aid):
+    with connection() as conn:
+        appt = conn.execute("""SELECT a.appointment_id,p.name AS patient,d.name AS doctor,a.appointment_date,a.appointment_time
+            FROM appointments a JOIN patients p USING(patient_id) JOIN doctors d USING(doctor_id)
+            WHERE a.appointment_id=? AND a.status='booked'""", (aid,)).fetchone()
+        if not appt:
+            return jsonify(ok=False,message="Active appointment not found."),404
+        message = f"Reminder for {appt['patient']}: appointment with {appt['doctor']} on {appt['appointment_date']} at {display_time(appt['appointment_time'])}."
+        conn.execute("INSERT INTO reminders(appointment_id,message) VALUES(?,?)",(aid,message))
+    return jsonify(ok=True,message="SIMULATED reminder: "+message)
 
-@app.route("/api/report")
+
+@app.get("/api/report")
 def report():
-
-    rows = run_query("""
-        SELECT
-            a.appointment_id,
-            a.attended_before,
-            a.booking_lead_days,
-            p.name AS patient,
-            d.name AS doctor
-        FROM appointments a
-        JOIN patients p ON p.patient_id = a.patient_id
-        JOIN doctors d ON d.doctor_id = a.doctor_id
-        WHERE a.status = 'booked'
-    """)
-
-    counts = run_query("""
-        SELECT
-            COUNT(*) FILTER (WHERE status = 'booked') AS booked,
-            COUNT(*) FILTER (WHERE status = 'cancelled') AS cancelled
-        FROM appointments
-    """, fetch="one")
-
-    risks = []
-
-    for r in rows:
-
-        score, reason = risk_score(
-            r["attended_before"],
-            r["booking_lead_days"]
-        )
-
-        risks.append({
-            "id": r["appointment_id"],
-            "patient": r["patient"],
-            "doctor": r["doctor"],
-            "score": score,
-            "reason": reason
+    requested = request.args.get("date", date.today().isoformat())
+    try:
+        report_date = date.fromisoformat(requested)
+    except (TypeError, ValueError):
+        return jsonify(message="Choose a valid report date in YYYY-MM-DD format."), 400
+    with connection() as conn:
+        counts = conn.execute("""SELECT SUM(status='booked') AS booked,SUM(status='cancelled') AS cancelled
+            FROM appointments WHERE appointment_date=?""", (report_date.isoformat(),)).fetchone()
+        doctor_rows = conn.execute("""SELECT d.doctor_id,d.name AS doctor,d.specialty,
+            SUM(CASE WHEN a.status='booked' THEN 1 ELSE 0 END) AS booked
+            FROM doctors d LEFT JOIN appointments a ON a.doctor_id=d.doctor_id
+                AND a.appointment_date=?
+            WHERE d.available=1 GROUP BY d.doctor_id ORDER BY d.specialty,d.name""",
+            (report_date.isoformat(),)).fetchall()
+        rows = conn.execute("""SELECT a.appointment_id,p.name AS patient,d.name AS doctor,a.attended_before,a.booking_lead_days
+            FROM appointments a JOIN patients p USING(patient_id) JOIN doctors d USING(doctor_id)
+            WHERE a.status='booked' AND a.appointment_date=?""", (report_date.isoformat(),)).fetchall()
+    capacity = len(doctor_rows) * len(SLOT_TIMES)
+    booked_today = counts["booked"] or 0
+    utilisation = round(booked_today * 100 / capacity, 1) if capacity else 0
+    utilisation_by_doctor = []
+    for row in doctor_rows:
+        booked = row["booked"] or 0
+        utilisation_by_doctor.append({
+            "doctor": row["doctor"], "specialty": row["specialty"],
+            "booked": booked, "capacity": len(SLOT_TIMES),
+            "utilisation_pct": round(booked * 100 / len(SLOT_TIMES), 1),
         })
+    risks = []
+    for row in rows:
+        score, reason = risk_score(row["attended_before"], row["booking_lead_days"])
+        risks.append(dict(id=row["appointment_id"],patient=row["patient"],doctor=row["doctor"],score=score,reason=reason))
+    return jsonify(date=report_date.isoformat(), booked=booked_today,
+                   cancelled=counts["cancelled"] or 0, capacity=capacity,
+                   utilisation_pct=utilisation, utilisation_by_doctor=utilisation_by_doctor,
+                   risk=risks,
+                   utilisation_note="Booked slots divided by seven demo appointment slots per doctor. This is a scheduling estimate, not a clinical metric.")
 
-    return jsonify({
-        "booked": counts["booked"],
-        "cancelled": counts["cancelled"],
-        "risk": risks,
-        "utilisation_note": (
-            "Explainable demo estimate using synthetic data; "
-            "not a validated prediction model."
-        )
-    })
 
-
-# ==========================================
-# RESCHEDULE APPOINTMENT
-# ==========================================
-
-@app.route("/api/reschedule", methods=["POST"])
+@app.post("/api/reschedule")
 def reschedule():
-
-    data = request.json or {}
-
-    aid = int(data.get("id", 0))
-    new_date = date.fromisoformat(data.get("date", ""))
-    new_time = data.get("time", "")
-
-    a = run_query("""
-        SELECT doctor_id
-        FROM appointments
-        WHERE appointment_id = %s
-        AND status = 'booked'
-    """, (aid,), "one")
-
-    if not a:
-        return jsonify({
-            "ok": False,
-            "message": "Active appointment not found."
-        }), 404
-
-    if new_time not in available_slots(a["doctor_id"], new_date):
-        return jsonify({
-            "ok": False,
-            "message": "That slot is not available."
-        }), 409
-
-    run_query("""
-        UPDATE appointments
-        SET appointment_date = %s,
-            appointment_time = %s
-        WHERE appointment_id = %s
-    """, (new_date, new_time, aid), "none")
-
-    return jsonify({
-        "ok": True,
-        "message": (
-            f"Appointment #{aid} rescheduled to "
-            f"{new_date} at {new_time}."
-        )
-    })
+    data = json_body()
+    try:
+        aid = int(data.get("id", 0))
+        new_date = date.fromisoformat(data.get("date", ""))
+    except (ValueError, TypeError):
+        return jsonify(ok=False,message="Provide a valid appointment ID and date (YYYY-MM-DD)."),400
+    new_time = data.get("time")
+    if not isinstance(new_time,str) or new_time not in SLOT_TIMES:
+        return jsonify(ok=False,message="Choose a valid clinic appointment time."),400
+    try:
+        with connection() as conn:
+            appt = conn.execute("SELECT doctor_id FROM appointments WHERE appointment_id=? AND status='booked'",(aid,)).fetchone()
+            if not appt:
+                return jsonify(ok=False,message="Active appointment not found."),404
+            if new_time not in available_slots(appt["doctor_id"],new_date,aid):
+                return jsonify(ok=False,message="That slot is not available."),409
+            conn.execute("UPDATE appointments SET appointment_date=?,appointment_time=?,booking_lead_days=? WHERE appointment_id=?",(new_date.isoformat(),new_time,max(0,(new_date-date.today()).days),aid))
+    except sqlite3.IntegrityError:
+        return jsonify(ok=False,message="That slot has just been booked. Please choose another time."),409
+    return jsonify(ok=True,message=f"Appointment #{aid} rescheduled to {new_date} at {display_time(new_time)}.")
 
 
-# ==========================================
-# START APPLICATION
-# ==========================================
+init_db()
 
 if __name__ == "__main__":
-    init_sample_data()
     app.run(debug=True, host="127.0.0.1", port=5000)
